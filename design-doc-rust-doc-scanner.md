@@ -91,9 +91,9 @@ Purpose-built for receipts/invoices/statements, often with layout-aware field ex
 
 - OCR: local Tesseract (`leptess`), not a cloud Document-AI API.
 - Structuring: rule-based parsers per known format (regex/heuristics for `qty x price` line items, `date / description / amount / balance` transaction rows), not an LLM call.
-- Consequence: format coverage grows only as fast as you write parsers for new bank/retailer layouts. This is the direct cost of staying local-only, and it should shape the roadmap — §12 now assumes an ongoing "add a parser for format X" workstream rather than a one-time LLM-fallback build.
+- Consequence: format coverage grows only as fast as new parsers are written for new bank/retailer layouts. This is the direct cost of staying local-only, and it should shape the roadmap — §12 now assumes an ongoing "add a parser for format X" workstream rather than a one-time LLM-fallback build.
 - Stage-5 validation (schema conformance + sanity checks like line-item sum ≈ stated total) is what catches a parser silently producing wrong data, since there's no LLM safety net to fall back on — so it's not optional, it's load-bearing.
-- If a document's format isn't recognized by any parser, the correct behavior is a clean `error.code: "UNRECOGNIZED_FORMAT"` JSON output, not a best-effort guess. Recognizing that you don't have a parser for something is safer than partially parsing it wrong.
+- If a document's format isn't recognized by any parser, the correct behavior is a clean `error.code: "UNRECOGNIZED_FORMAT"` JSON output, not a best-effort guess. Recognizing the absence of a parser for a format is safer than partially parsing it wrong.
 - Worth tracking as the parser library grows: which formats it covers, so it's obvious when a new bank/retailer needs a new parser versus hitting an existing one's edge case.
 
 ---
@@ -225,7 +225,7 @@ doc-scanner seed-report --input-dir <dir> [--format json|csv] [--taxonomy <path>
 ```
 
 - **stdout**: reserved exclusively for the JSON payload (success or error, or the seed report) — always exactly one JSON document per invocation.
-- **stderr**: reserved for human-readable logs/diagnostics (via `tracing`), so `doc-scanner ... 2>/dev/null` gives you clean JSON every time. This matters for scripting and for the future service wrapper, which will reuse the same logging convention. `--log-file` redirects this to a file instead, still never mixing with stdout.
+- **stderr**: reserved for human-readable logs/diagnostics (via `tracing`), so `doc-scanner ... 2>/dev/null` produces clean JSON every time. This matters for scripting and for the future service wrapper, which will reuse the same logging convention. `--log-file` redirects this to a file instead, still never mixing with stdout.
 - **Exit codes**: `0` success, `1` generic failure, `2` invalid arguments/input file, `3` unsupported format, `4` extraction failure, `5` classification failure, `6` output write failure. The JSON error envelope's `error.code` carries the specific reason; exit code is coarse-grained for shell scripting. `seed-report` and `--emit-sql` reuse the same exit code conventions.
 
 ---
@@ -249,28 +249,28 @@ doc-scanner seed-report --input-dir <dir> [--format json|csv] [--taxonomy <path>
 
 ## 8. Error taxonomy & operational hardening
 
-Since this ingests arbitrary user-supplied files, treat it with the same suspicion you'd apply to any file-upload-handling service in production:
+Since this ingests arbitrary user-supplied files, it should be treated with the same suspicion as any file-upload-handling service in production:
 
 - **Resource limits**: cap input file size (config, e.g. 25 MB), cap OCR/rasterization time with a timeout, cap page count for multi-page PDFs.
 - **Malformed input**: PDF parsers and image decoders are historically a source of memory-safety and DoS bugs (malformed PDFs, decompression bombs). Rust's memory safety helps, but a hostile file can still hang a thread or consume unbounded memory — enforce timeouts and size limits regardless.
-- **No sensitive data in logs**: mask account numbers, names, etc. before anything hits `tracing`/stderr. The JSON payload on stdout is the only place full data should appear.
+- **No sensitive data in logs**: account numbers, names, etc. must be masked before anything hits `tracing`/stderr. The JSON payload on stdout is the only place full data should appear.
 - **Idempotency**: hash the input file content; the caller (web app) can use that hash to detect duplicate uploads before even invoking the engine.
 
 ---
 
 ## 9. Feasibility: plugging this into a web frontend
 
-Short answer: **yes, and your instinct is right that it belongs on the backend** — a browser can't invoke a native Rust binary or access the local filesystem the way this tool needs to. The frontend uploads a file to your web backend; the backend is what talks to this engine.
+Short answer: **yes, and this belongs on the backend** — a browser can't invoke a native Rust binary or access the local filesystem the way this tool needs to. The frontend uploads a file to the web backend; the backend is what talks to this engine.
 
 There are three ways to wire that up, in increasing order of operational maturity:
 
-1. **Subprocess per request.** Web backend (any language) spawns the CLI binary per upload, captures stdout, parses the JSON. Simplest to build, works today, but pays process-spawn overhead on every request and doesn't let you reuse connections (e.g. to a cloud OCR/LLM API) across requests. Fine for low volume or an MVP.
-2. **In-process library, if your web backend is also Rust.** Add `doc_scanner_core` as a dependency directly. No IPC, no subprocess, no network hop — just a function call. This is the cleanest option if you're open to a Rust web backend (e.g. `axum`).
-3. **Standalone microservice.** Wrap `doc_scanner_core` in a small `axum` HTTP service (`POST /v1/convert`, multipart upload, same JSON envelope as the response body). Any web backend, in any language, calls this over HTTP. This is the best fit if your main web app is *not* Rust, or if you want the conversion engine to scale/deploy independently from the rest of the app (which, given your SRE background, is probably the instinct you already have — separate blast radius, separate scaling, separate resource limits for something that does CPU/OCR-heavy work).
+1. **Subprocess per request.** Web backend (any language) spawns the CLI binary per upload, captures stdout, parses the JSON. Simplest to build, works today, but pays process-spawn overhead on every request and doesn't allow connection reuse (e.g. to a cloud OCR/LLM API) across requests. Fine for low volume or an MVP.
+2. **In-process library, if the web backend is also Rust.** Add `doc_scanner_core` as a dependency directly. No IPC, no subprocess, no network hop — just a function call. This is the cleanest option when a Rust web backend (e.g. `axum`) is already in play.
+3. **Standalone microservice.** Wrap `doc_scanner_core` in a small `axum` HTTP service (`POST /v1/convert`, multipart upload, same JSON envelope as the response body). Any web backend, in any language, calls this over HTTP. This is the best fit when the main web app is *not* Rust, or when the conversion engine needs to scale/deploy independently from the rest of the app — a reasonable instinct for anyone used to separating blast radius, scaling, and resource limits for CPU/OCR-heavy work.
 
-Because the CLI was built with the logic isolated in a library crate from the start, **moving from option 1 to option 3 is additive, not a rewrite** — you write a new thin binary (`doc_scanner_service`) alongside the existing CLI binary, both calling the same `doc_scanner_core`.
+Because the CLI was built with the logic isolated in a library crate from the start, **moving from option 1 to option 3 is additive, not a rewrite** — a new thin binary (`doc_scanner_service`) sits alongside the existing CLI binary, both calling the same `doc_scanner_core`.
 
-**Recommended path:** build the CLI first (fast to iterate, easy to test with golden files), validate accuracy on real sample documents, then add the `axum` service wrapper once you're ready to wire up the web app. Keep the CLI around after that — it stays useful for local debugging, batch backfills, and support tooling. Given current scope is occasional/personal use (§13), option 1 (subprocess-per-request) is a perfectly reasonable stopping point — there's no need to build the microservice wrapper until volume or deployment requirements actually call for it.
+**Recommended path:** build the CLI first (fast to iterate, easy to test with golden files), validate accuracy on real sample documents, then add the `axum` service wrapper once the web app is ready to be wired up. Keep the CLI around after that — it stays useful for local debugging, batch backfills, and support tooling. Given current scope is occasional/personal use (§13), option 1 (subprocess-per-request) is a perfectly reasonable stopping point — there's no need to build the microservice wrapper until volume or deployment requirements actually call for it.
 
 ---
 
@@ -316,11 +316,11 @@ doc-scanner seed-report --input-dir <dir> [--format json|csv] [--taxonomy <path>
 - Produces a ranked list: `{ merchant, occurrences, example_raw_text: [...], suggested_category }`, sorted by frequency.
 - Default output is JSON, consistent with the rest of the tool; `--format csv` is worth supporting here specifically, since — unlike the main conversion output — this is meant to be opened, reviewed, and hand-edited before anything reaches the database.
 
-This is explicitly a **human-in-the-loop, offline bootstrapping tool** — it runs once (or occasionally, as new samples arrive), it's outside the production ingestion path, and nothing here writes to Postgres automatically. The workflow is: run `seed-report` → review/edit the list (merge merchants the heuristic split apart, fix a wrong suggested category, delete ones you don't want seeded) → feed the finalized list back in with `--emit-sql`, which converts it into ready-to-run `INSERT INTO merchant_category_rules (..., source) VALUES (..., 'system_seed')` statements for §10.7's migration. This lives in `doc_scanner_cli` (as a second subcommand alongside the existing conversion command), not in `doc_scanner_core` — it's a batch/reporting driver over the core library's per-document output, not a separate implementation of the enrichment logic itself.
+This is explicitly a **human-in-the-loop, offline bootstrapping tool** — it runs once (or occasionally, as new samples arrive), it's outside the production ingestion path, and nothing here writes to Postgres automatically. The workflow is: run `seed-report` → review/edit the list (merge merchants the heuristic split apart, fix a wrong suggested category, delete unwanted entries) → feed the finalized list back in with `--emit-sql`, which converts it into ready-to-run `INSERT INTO merchant_category_rules (..., source) VALUES (..., 'system_seed')` statements for §10.7's migration. This lives in `doc_scanner_cli` (as a second subcommand alongside the existing conversion command), not in `doc_scanner_core` — it's a batch/reporting driver over the core library's per-document output, not a separate implementation of the enrichment logic itself.
 
 ### 10.3 Currency: make it a global reference table, not per-tenant
 
-Today `currencies` is tenant-scoped (`tenant_id NOT NULL`, unique on `(tenant_id, code)`), which is exactly the problem you flagged — nothing stops one tenant from having a row where `code = 'USD'` and `name = 'USDollar'`. Currencies should be a single platform-owned lookup seeded from ISO 4217, where tenants only *select* a code, never author one.
+Today `currencies` is tenant-scoped (`tenant_id NOT NULL`, unique on `(tenant_id, code)`) — nothing stops one tenant from having a row where `code = 'USD'` and `name = 'USDollar'`. Currencies should be a single platform-owned lookup seeded from ISO 4217, where tenants only *select* a code, never author one.
 
 This is a **breaking migration**, not additive — worth treating with the same care as any production schema change with live FKs pointing at the table being restructured:
 
@@ -347,7 +347,7 @@ This is a **breaking migration**, not additive — worth treating with the same 
      -- ... remaining ISO 4217 currencies
    ON CONFLICT (code) DO NOTHING;
    ```
-6. `is_system` no longer means much once tenants can't author currencies at all — repurpose it (or drop it) as a simple "shown in the picker by default" flag if you want a curated subset surfaced before "show all currencies."
+6. `is_system` no longer means much once tenants can't author currencies at all — repurpose it (or drop it) as a simple "shown in the picker by default" flag to surface a curated subset before "show all currencies."
 
 Since steps 1–3 depend on what's actually in the live data (how many duplicate rows exist, whether any tenant has non-standard codes), this needs a real migration script run and reviewed against production data, not just the DDL above — flagging that explicitly given how this class of change tends to bite in production.
 
@@ -381,7 +381,7 @@ CREATE INDEX idx_ingestion_audit_tenant_created ON public.document_ingestion_aud
 CREATE INDEX idx_ingestion_audit_source_document ON public.document_ingestion_audit USING btree (source_document_id);
 ```
 
-Append-only — rows are never updated or deleted. This is what lets you answer "who changed this transaction's category, and when" or "did this upload actually produce the expenses I'm looking at," which neither `audit_logs` nor a mutable `expenses` row can answer on its own.
+Append-only — rows are never updated or deleted. This is what makes questions like "who changed this transaction's category, and when" or "did this upload actually produce the expected expenses" answerable, which neither `audit_logs` nor a mutable `expenses` row can answer on its own.
 
 ### 10.5 Statement header data
 
@@ -562,7 +562,7 @@ Every ingested row from one document shares the same `source_document_id`; combi
 
 Two reasonable paths, not mutually exclusive:
 - **Off-the-shelf BI** (Grafana or Metabase) pointed at Postgres — fastest to stand up, good for internal/ops-style dashboards. Filter `status = 'active'` and `categories.type = 'expense'` for any "spend" view.
-- **Custom web dashboard** — your web app's own API layer runs aggregate SQL (grouped by `categories.type`, `category_id`, month) and a JS charting library (Chart.js, Recharts) renders it. Better fit if the dashboard needs to be user-facing and tightly integrated with your app's auth/UX, and it already follows the tenant-scoping pattern the rest of the schema uses.
+- **Custom web dashboard** — the web app's own API layer runs aggregate SQL (grouped by `categories.type`, `category_id`, month) and a JS charting library (Chart.js, Recharts) renders it. Better fit if the dashboard needs to be user-facing and tightly integrated with the app's auth/UX, and it already follows the tenant-scoping pattern the rest of the schema uses.
 
 ---
 
@@ -591,14 +591,14 @@ Two reasonable paths, not mutually exclusive:
 
 ---
 
-## 13. Open questions for you
+## 13. Open questions
 
-None remaining that need your input right now — the last three are resolved below. This doc is otherwise ready to move on from "design" into "build."
+None remaining right now — the last three are resolved below. This doc is otherwise ready to move on from "design" into "build."
 
 **Decided this round:**
 - **Sample documents**: confirmed available. Use them for two things at once: seed the golden-file test corpus (§11), and derive the initial `merchant_category_rules` seed rows (§10.2) from the merchant/description strings that actually appear in them — real data beats a generic starter list, and it's no extra work since the samples are being processed anyway.
 - **Volume/scale**: occasional/personal use for now; production-scale concerns explicitly deferred. Practical effect: no rush to the `axum` microservice (§9 option 3) — the subprocess-per-request approach (§9 option 1) is perfectly adequate at this volume, and phase 4 in the roadmap can move later without cost. Revisit if/when usage grows.
-- **Merchant seed list**: not a separate taxonomy decision — it's just the initial rows in `merchant_category_rules`, generated from your own sample documents rather than invented generically (see above).
+- **Merchant seed list**: not a separate taxonomy decision — it's just the initial rows in `merchant_category_rules`, generated from the available sample documents rather than invented generically (see above).
 
 **Previously decided:**
 - Structuring is local-only — Tesseract OCR + rule-based parsers, no LLM/cloud calls (§4).
