@@ -48,15 +48,15 @@ crates/
       structure/
         bank_statement.rs
         grocery_bill.rs
-        llm_backend.rs    # optional LLM-assisted structuring
       taxonomy.rs        # merchant normalization + starter-taxonomy matching, see §5.5 — shared by
                           #   every `convert` call (per-line enrichment) and `seed-report` (aggregation)
       schema.rs          # serde structs for output + JSON Schema validation
       error.rs           # typed error enum -> JSON error envelope
+      observability.rs   # OTEL-shaped structured log record for every convert call, see §14
   doc_scanner_cli/       # binary: clap args, stdout/file writing, exit codes
                           #   subcommand `convert` (default) — the main pipeline above
                           #   subcommand `seed-report` — merchant/category bootstrapping, see §10.2.1
-  doc_scanner_service/   # binary: axum HTTP wrapper (phase 2, see §9)
+    src/logging.rs        # picks the tracing-subscriber writer (stderr or --log-file), see §14.3
 ```
 
 ---
