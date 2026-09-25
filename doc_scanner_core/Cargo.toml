@@ -1,0 +1,13 @@
+[package]
+name = "doc_scanner_core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+pdf-extract = "0.7"
+sha2 = "0.10"
